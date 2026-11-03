@@ -11,7 +11,6 @@ import {
 } from "vscode-languageserver";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { URI } from "vscode-uri";
-import * as path from "node:path";
 import {
   doCompletion,
   doCompletionResolve,
@@ -356,11 +355,14 @@ export class AnsibleLanguageService {
             params.textDocument.uri,
           );
           if (context) {
+            // The document directory is already searched by the resolver, so
+            // the workspace root is the only extra base directory needed.
+            const workspaceRoot = URI.parse(context.workspaceFolder.uri).fsPath;
             return await getDefinition(
               document,
               params.position,
               await context.docsLibrary,
-              [path.dirname(URI.parse(document.uri).fsPath)],
+              [workspaceRoot],
               (reference) => {
                 this.connection.console.info(`File not found: ${reference}`);
               },

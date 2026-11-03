@@ -1,5 +1,4 @@
 import * as path from "node:path";
-import { homedir } from "node:os";
 import { stat } from "node:fs/promises";
 
 /**
@@ -37,7 +36,12 @@ const FILE_REFERENCE_MODULES: Record<string, FileReferenceSpec> = {
   },
   include_tasks: { dirname: "tasks", options: ["file"], freeForm: true },
   import_tasks: { dirname: "tasks", options: ["file"], freeForm: true },
-  include_vars: { dirname: "vars", options: ["file"], freeForm: true },
+  include_vars: {
+    dirname: "vars",
+    options: ["file", "dir"],
+    freeForm: true,
+    allowDirectory: true,
+  },
   import_playbook: {
     dirname: "",
     options: [],
@@ -47,6 +51,17 @@ const FILE_REFERENCE_MODULES: Record<string, FileReferenceSpec> = {
 };
 
 const BUILTIN_PREFIX = /^ansible\.(builtin|legacy)\./;
+
+/** Upper bound for the upward walk that looks for a role root. */
+const MAX_ROLE_SEARCH_DEPTH = 10;
+
+/**
+ * Whether a value contains Jinja and so cannot be resolved statically.
+ * Single source of truth, shared with the definition provider.
+ */
+export function isTemplatedValue(value: string): boolean {
+  return value.includes("{{") || value.includes("{%");
+}
 
 /**
  * Returns the file reference spec for a module name, accepting both the short
@@ -85,11 +100,12 @@ export function isFileReference(
 
 /**
  * When the file is part of a role (`<role>/tasks/...` or
- * `<role>/handlers/...`) returns the role directory.
+ * `<role>/handlers/...`) returns the role directory. The walk is bounded so a
+ * coincidental `tasks` directory far up the tree is never picked up.
  */
 function findRoleRoot(fileDir: string): string | undefined {
   let current = fileDir;
-  for (;;) {
+  for (let depth = 0; depth < MAX_ROLE_SEARCH_DEPTH; depth++) {
     const parent = path.dirname(current);
     if (parent === current) {
       return undefined;
@@ -100,6 +116,20 @@ function findRoleRoot(fileDir: string): string | undefined {
     }
     current = parent;
   }
+  return undefined;
+}
+
+/** Whether `candidate` is `root` itself or located inside it. */
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  if (relative === "") {
+    return true;
+  }
+  return (
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
 }
 
 async function isValidPath(
@@ -115,29 +145,38 @@ async function isValidPath(
 }
 
 /**
+ * The directories a reference may resolve into: the role root (when inside a
+ * role), the directory of the file that contains the task, and the base
+ * directories supplied by the caller. Deduplicated.
+ */
+function getSearchRoots(documentPath: string, basedirs: string[]): string[] {
+  const documentDir = path.dirname(documentPath);
+  const roleRoot = findRoleRoot(documentDir);
+  const roots = [roleRoot, documentDir, ...basedirs]
+    .filter((p): p is string => !!p)
+    .map((p) => path.resolve(p));
+  return [...new Set(roots)];
+}
+
+/**
  * Builds the ordered list of locations that ansible-playbook looks at, which
  * mirrors Ansible's relative path resolution and `Task.get_search_path()`:
+ * for each search root, `<root>/<dirname>/<reference>` then `<root>/<reference>`.
  *
- *  1. role directory (when inside a role): `<role>/<dirname>/<src>`, `<role>/<src>`
- *  2. directory of the file that contains the task, same two patterns
+ *  1. role directory (when inside a role)
+ *  2. directory of the file that contains the task
  *  3. the playbook base directory (or workspace folder as a fallback)
  */
 function getSearchCandidates(
   reference: string,
   dirname: string,
-  documentPath: string,
-  basedirs: string[] = [],
+  searchRoots: string[],
 ): string[] {
   const candidates: string[] = [];
-  const documentDir = path.dirname(documentPath);
-  const roleRoot = findRoleRoot(documentDir);
-  const searchPaths = [roleRoot, documentDir, ...basedirs].filter(
-    (p): p is string => !!p,
-  );
   // do not add the dirname when the user already spelled it, e.g. `files/a.txt`
   const alreadyHasDirname = !dirname || reference.split("/")[0] === dirname;
 
-  for (const base of searchPaths) {
+  for (const base of searchRoots) {
     if (!alreadyHasDirname) {
       candidates.push(path.resolve(base, dirname, reference));
     }
@@ -148,8 +187,9 @@ function getSearchCandidates(
 
 /**
  * Resolves a file reference found in a task to a file on disk, or
- * `undefined` when nothing matches or the value cannot be resolved
- * statically (e.g. it uses Jinja templating).
+ * `undefined` when nothing matches, the value cannot be resolved statically
+ * (e.g. Jinja templating), or the result would fall outside the allowed
+ * search roots (path traversal such as `../../../etc/shadow`).
  */
 export async function resolveFileReference(
   reference: string,
@@ -159,24 +199,24 @@ export async function resolveFileReference(
   allowDirectory = false,
 ): Promise<string | undefined> {
   const value = reference.trim();
-  if (!value || value.includes("{{") || value.includes("{%")) {
+  if (!value || isTemplatedValue(value)) {
     return undefined;
   }
 
-  // absolute and home-relative paths do not use the search path
-  if (value.startsWith("/") || value === "~" || value.startsWith("~/")) {
-    const absolute = value.startsWith("~")
-      ? path.join(homedir(), value.slice(1))
-      : value;
-    return (await isValidPath(absolute, allowDirectory)) ? absolute : undefined;
+  // home-relative paths are not expanded: they point outside the project
+  if (value === "~" || value.startsWith("~/")) {
+    return undefined;
   }
 
-  for (const candidate of getSearchCandidates(
-    value,
-    dirname,
-    documentPath,
-    basedirs,
-  )) {
+  const searchRoots = getSearchRoots(documentPath, basedirs);
+  const candidates = path.isAbsolute(value)
+    ? [path.resolve(value)]
+    : getSearchCandidates(value, dirname, searchRoots);
+
+  for (const candidate of candidates) {
+    if (!searchRoots.some((root) => isWithin(root, candidate))) {
+      continue;
+    }
     if (await isValidPath(candidate, allowDirectory)) {
       return candidate;
     }

@@ -5,6 +5,7 @@ import { isScalar, Node, YAMLMap, YAMLSeq } from "yaml";
 import { DocsLibrary } from "@src/services/docsLibrary.js";
 import {
   isFileReference,
+  isTemplatedValue,
   resolveFileReference,
 } from "@src/utils/fileReference.js";
 import { toLspRange } from "@src/utils/misc.js";
@@ -146,7 +147,7 @@ async function getFileDefinition(
   );
   if (!target) {
     const reference = node.value.trim();
-    if (reference && !reference.includes("{{") && !reference.includes("{%")) {
+    if (reference && !isTemplatedValue(reference)) {
       onUnresolvedReference?.(reference);
     }
     return null;

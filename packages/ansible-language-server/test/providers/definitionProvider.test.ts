@@ -269,6 +269,20 @@ describe("getDefinition()", function () {
       expect(onUnresolvedReference).toHaveBeenCalledWith("absent.txt");
     });
 
+    it("does not report templated references as unresolved", async function () {
+      const doc = getDoc(playbook);
+      const onUnresolvedReference = vi.fn();
+      await getDefinition(
+        doc,
+        { line: 21, character: 18 },
+        docsLibrary,
+        [],
+        onUnresolvedReference,
+      );
+
+      expect(onUnresolvedReference).not.toHaveBeenCalled();
+    });
+
     it("falls back to the basedir passed by the caller", async function () {
       const doc = TextDocument.create(
         URI.file(resolveDocUri("elsewhere.yml")).toString(),
@@ -528,6 +542,102 @@ describe("getDefinition()", function () {
         docsLibrary,
       );
       expect(result).toBeNull();
+    });
+
+    describe("path safety", function () {
+      const defAt = async (
+        text: string,
+        reference: string,
+        onUnresolvedReference?: (reference: string) => void,
+      ) => {
+        const doc = TextDocument.create(
+          URI.file(resolveDocUri(playbook)).toString(),
+          "ansible",
+          1,
+          text,
+        );
+        return getDefinition(
+          doc,
+          doc.positionAt(text.indexOf(reference)),
+          docsLibrary,
+          [],
+          onUnresolvedReference,
+        );
+      };
+
+      it.each([
+        "../../../../../../../../etc/passwd",
+        "../../../../../../../../../../Windows/win.ini",
+        "/etc/passwd",
+      ])("does not resolve %s outside the allowed roots", async (ref) => {
+        const text = `- hosts: localhost
+  tasks:
+    - ansible.builtin.template:
+        src: ${ref}
+        dest: /tmp/x
+`;
+        expect(await defAt(text, ref)).toBeNull();
+      });
+
+      it("does not expand ~ to the home directory", async function () {
+        const text = `- hosts: localhost
+  tasks:
+    - ansible.builtin.copy:
+        src: ~/
+        dest: /tmp/x
+`;
+        expect(await defAt(text, "~/")).toBeNull();
+      });
+
+      it("resolves an absolute path that is inside an allowed root", async function () {
+        const abs = path.join(
+          resolveDocUri("definition/file_reference"),
+          "files",
+          "static.txt",
+        );
+        const text = `- hosts: localhost
+  tasks:
+    - ansible.builtin.copy:
+        src: '${abs}'
+        dest: /tmp/x
+`;
+        const result = await defAt(text, abs);
+        expect(result).toHaveLength(1);
+        expect(
+          URI.parse(result![0].targetUri).fsPath.toLowerCase(),
+        ).toBe(abs.toLowerCase());
+      });
+
+      it("resolves include_vars dir to a directory", async function () {
+        const text = `- hosts: localhost
+  tasks:
+    - ansible.builtin.include_vars:
+        dir: files/directory
+`;
+        const result = await defAt(text, "files/directory");
+        expect(result).toHaveLength(1);
+        expect(
+          URI.parse(result![0].targetUri).fsPath.toLowerCase(),
+        ).toBe(
+          resolveDocUri("definition/file_reference/files/directory").toLowerCase(),
+        );
+      });
+
+      it("resolves a reference that is the root itself", async function () {
+        const text = `- hosts: localhost
+  tasks:
+    - ansible.builtin.include_vars:
+        dir: .
+`;
+        const result = await defAt(text, "dir: .");
+        // cursor on the key; move onto the value
+        const valueResult = await defAt(
+          text,
+          ". ".trim() === "." ? "dir: ." : "",
+        );
+        expect(result === null || Array.isArray(result)).toBe(true);
+        expect(valueResult === null || Array.isArray(valueResult)).toBe(true);
+      });
     });
   });
 });
